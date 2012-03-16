@@ -5,7 +5,6 @@ import java.net.InetSocketAddress;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Executors;
 
 import org.jboss.netty.bootstrap.ServerBootstrap;
@@ -21,11 +20,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
-import de.tuberlin.dima.presslufthammer.data.SchemaNode;
+import de.tuberlin.dima.presslufthammer.qexec.QueryHelper;
 import de.tuberlin.dima.presslufthammer.query.Query;
-import de.tuberlin.dima.presslufthammer.query.SelectClause;
+import de.tuberlin.dima.presslufthammer.query.sema.SemaError;
+import de.tuberlin.dima.presslufthammer.query.sema.SemanticChecker;
 import de.tuberlin.dima.presslufthammer.transport.messages.MessageType;
 import de.tuberlin.dima.presslufthammer.transport.messages.QueryMessage;
 import de.tuberlin.dima.presslufthammer.transport.messages.SimpleMessage;
@@ -136,26 +135,18 @@ public class Coordinator extends ChannelNode implements Stoppable {
                 Query query = message.getQuery();
 
                 String tableName = query.getTableName();
-                if (!tables.containsKey(tableName)) {
-                    client.write(new SimpleMessage(MessageType.CLIENT_RESULT,
-                            (byte) -1, "Table not available".getBytes()));
-                    log.info("Table {} not in tables.", tableName);
-                } else {
+                SemanticChecker sema = new SemanticChecker();
+                try {
+                    sema.checkQuery(query, tables);
                     TableConfig table = tables.get(tableName);
-                    Set<String> projectedFields = Sets.newHashSet();
-                    for (SelectClause selectClause : query.getSelectClauses()) {
-                        projectedFields.add(selectClause.getColumn());
-                    }
-                    SchemaNode projectedSchema = null;
-                    if (projectedFields.contains("*")) {
-                        log.debug("Query is a 'select * ...' query.");
-                        projectedSchema = table.getSchema();
-                    } else {
-                        projectedSchema = table.getSchema().project(
-                                projectedFields);
-                    }
-                    queries.put(qid, new QueryHandler(table.getNumPartitions(),
-                            message, projectedSchema, client));
+                    QueryHelper queryHelper = new QueryHelper(query,
+                            table.getSchema());
+                    queries.put(
+                            qid,
+                            new QueryHandler(table.getNumPartitions(), message
+                                    .getQueryId(), queryHelper
+                                    .getRewrittenQuery(), queryHelper
+                                    .getResultSchema(), client));
 
                     // send a request to the leafs for every partition
                     Iterator<Channel> leafIter = leafChannels.iterator();
@@ -169,7 +160,8 @@ public class Coordinator extends ChannelNode implements Stoppable {
                             leaf = leafIter.next();
                         }
                         // create a new query for only the specific partition
-                        Query leafQuery = new Query(query);
+                        Query leafQuery = new Query(
+                                queryHelper.getRewrittenChildQuery());
                         leafQuery.setPartition(i);
                         QueryMessage leafMessage = new QueryMessage(qid,
                                 leafQuery);
@@ -177,6 +169,9 @@ public class Coordinator extends ChannelNode implements Stoppable {
                         log.info("Sent query to leaf {}: {}",
                                 leaf.getRemoteAddress(), leafQuery);
                     }
+                } catch (SemaError e) {
+                    client.write(new SimpleMessage(MessageType.CLIENT_RESULT,
+                            (byte) -1, e.getMessage().getBytes()));
                 }
             }
 
